@@ -503,7 +503,7 @@ class Vimeo
         $response = curl_exec($curl);
         $curl_info = curl_getinfo($curl);
 
-        if (isset($curl_info['http_code']) && $curl_info['http_code'] === 0) {
+        if ($response === false) {
             $curl_error = curl_error($curl);
             $curl_error = !empty($curl_error) ? ' [' . $curl_error .']' : '';
             throw new VimeoRequestException('Unable to complete request.' . $curl_error);
@@ -556,8 +556,8 @@ class Vimeo
             CURLOPT_POST => true,
             CURLOPT_CUSTOMREQUEST => 'PATCH',
             CURLOPT_INFILE => $file,
-            CURLOPT_INFILESIZE => filesize($file_path),
             CURLOPT_UPLOAD => true,
+            CURLINFO_HEADER_OUT => true,
             CURLOPT_HTTPHEADER => array(
                 'Expect: ',
                 'Content-Type: application/offset+octet-stream',
@@ -575,6 +575,7 @@ class Vimeo
             // we'll need to alter the content of the header for each upload segment request.
             array_pop($curl_opts[CURLOPT_HTTPHEADER]);
             $curl_opts[CURLOPT_HTTPHEADER][] = 'Upload-Offset: ' . $server_at;
+            $curl_opts[CURLOPT_INFILESIZE] = $file_size - $server_at;
 
             fseek($file, $server_at);
 
@@ -597,22 +598,20 @@ class Vimeo
 
                 // If we didn't receive a 204 response from the tus server, then we should verify what's going on before
                 // proceeding to upload more pieces.
-                $verify_response = $this->request($url, array(), 'HEAD');
-                if ($verify_response['status'] !== 200) {
-                    $verify_error = !empty($ticket['body']) ? ' [' . $ticket['body'] . ']' : '';
-                    throw new VimeoUploadException('Unable to verify upload' . $verify_error);
-                }
-
-                if ($verify_response['headers']['Upload-Offset'] === $file_size) {
+                $server_at = $this->verify($url);
+                if ($server_at === $file_size) {
                     break;
                 }
-
-                $server_at = $verify_response['headers']['Upload-Offset'];
             } catch (VimeoRequestException $exception) {
                 // We likely experienced a timeout, but if we experience three in a row, then we should back off and
                 // fail so as to not overwhelm servers that are, probably, down.
                 if ($failures >= 3) {
                     throw $exception;
+                }
+
+                $server_at = $this->verify($url);
+                if ($server_at === $file_size) {
+                    break;
                 }
 
                 $failures++;
@@ -623,5 +622,32 @@ class Vimeo
         } while ($server_at < $file_size);
 
         return $attempt['body']['uri'];
+    }
+
+    /**
+     * Get upload offset from server
+     *
+     * @param string $url
+     * @return int
+     * @throws VimeoRequestException
+     * @throws VimeoUploadException
+     */
+    private function verify($url)
+    {
+        $curl_opts = array(
+            CURLOPT_CUSTOMREQUEST => 'HEAD',
+            CURLOPT_HTTPHEADER => array(
+                'Tus-Resumable: 1.0.0',
+                'Connection: close',
+            )
+        );
+
+        $response = $this->_request($url, $curl_opts);
+        if ($response['status'] !== 200) {
+            $verify_error = !empty($response['body']) ? ' [' . $response['body'] . ']' : '';
+            throw new VimeoUploadException('Unable to verify upload' . $verify_error);
+        }
+
+        return (int) $response['headers']['Upload-Offset'];
     }
 }
